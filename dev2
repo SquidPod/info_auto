@@ -1,0 +1,1061 @@
+import sys
+import json
+import math
+import random
+from pathlib import Path
+
+import pygame
+import numpy as np
+from scipy.ndimage import uniform_filter1d
+
+# ═══════════════════════════════════════════════════════════════
+# KONSTANTEN
+# ═══════════════════════════════════════════════════════════════
+FENSTER_BREITE = 1500
+FENSTER_HOEHE  = 1000
+FPS = 60
+
+# Spielfeld
+TOOLBAR_H = 72
+
+# Farben — Arcade-Palette
+C_BG          = (15,  18,  24)   # fast schwarz
+C_TOOLBAR     = (22,  26,  35)
+C_PANEL       = (32,  37,  50)
+C_PANEL_RAND  = (55,  62,  80)
+C_TEXT        = (210, 215, 228)
+C_TEXT_DIM    = (110, 118, 140)
+
+C_WEISS  = (255, 255, 255)
+C_SCHWARZ= (0,   0,   0)
+
+C_ROT         = (220,  55,  55)
+C_ROT_HELL    = (255,  85,  85)
+C_ROT_DIM     = (140,  35,  35)
+
+C_BLAU        = (50,  100, 220)
+C_BLAU_HELL   = (80,  130, 255)
+C_BLAU_DIM    = (30,   60, 140)
+
+C_GRUEN       = (45,  185, 100)
+C_GRUEN_HELL  = (70,  220, 130)
+C_GRUEN_DIM   = (25,  110,  60)
+
+C_ORANGE      = (230, 145,  35)
+C_ORANGE_HELL = (255, 175,  65)
+
+C_LILA        = (155,  65, 215)
+C_LILA_HELL   = (190, 100, 250)
+
+C_GELB        = (255, 220,  40)
+C_CYAN        = ( 45, 195, 210)
+
+# Gras
+C_GRAS_BASIS  = (68, 122, 50)
+C_GRAS_HELL   = (82, 145, 62)
+C_GRAS_DUNKEL = (52,  98, 40)
+
+# Physik
+MAX_SPEED         = 5.0
+MAX_OFFROAD_SPEED = 1.8
+ACCELERATION      = 0.15
+BRAKE_POWER       = 0.25
+FRICTION          = 0.04
+OFFROAD_FRICTION  = 0.12
+TURN_SPEED        = 2.2
+
+# Strecke
+DICKE_MIN     = 4
+DICKE_MAX     = 60
+DICKE_SCHRITT = 4
+GLAETTUNG     = 25
+GLAETTUNG_MIN = 4
+STRECKEN_SCHWELLE = 0.30
+
+# Auto
+AUTO_BREITE = 22
+AUTO_HOEHE  = 38
+
+# Checkpoint / Ziel
+CP_BREITE   = 120
+CP_HOEHE    = 14
+SZ_BREITE   = 140
+SZ_HOEHE    = 14
+HANDLE_R    = 8   # Radius des Drehgriffs
+
+SPEICHERDATEI = Path(__file__).parent / "strecke.json"
+
+
+# ═══════════════════════════════════════════════════════════════
+# MODUS
+# ═══════════════════════════════════════════════════════════════
+class Modus:
+    ZEICHNEN   = 0
+    START_ZIEL = 1
+    CHECKPOINT = 2
+    PLATZIEREN = 3
+    FAHREN     = 4
+
+
+# ═══════════════════════════════════════════════════════════════
+# HILFSFUNKTIONEN
+# ═══════════════════════════════════════════════════════════════
+def glaette_punkte(punkte):
+    if len(punkte) < GLAETTUNG_MIN:
+        return punkte
+    xs = np.array([p[0] for p in punkte], dtype=float)
+    ys = np.array([p[1] for p in punkte], dtype=float)
+    xs_g = uniform_filter1d(xs, size=GLAETTUNG, mode="nearest")
+    ys_g = uniform_filter1d(ys, size=GLAETTUNG, mode="nearest")
+    xs_g[0], ys_g[0] = xs[0], ys[0]
+    xs_g[-1], ys_g[-1] = xs[-1], ys[-1]
+    return [(int(x), int(y)) for x, y in zip(xs_g, ys_g)]
+
+def winkel_zwischen(cx, cy, mx, my):
+    return math.degrees(math.atan2(my - cy, mx - cx))
+
+def rotiere_punkt(px, py, cx, cy, grad):
+    rad = math.radians(grad)
+    dx, dy = px - cx, py - cy
+    return (cx + dx * math.cos(rad) - dy * math.sin(rad),
+            cy + dx * math.sin(rad) + dy * math.cos(rad))
+
+def obb_punkte(cx, cy, breite, hoehe, winkel_deg):
+    """Gibt die 4 Ecken eines rotierten Rechtecks zurück."""
+    hw, hh = breite / 2, hoehe / 2
+    ecken = [(-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh)]
+    return [rotiere_punkt(cx + ex, cy + ey, cx, cy, winkel_deg)
+            for ex, ey in ecken]
+
+def punkt_in_obb(px, py, cx, cy, breite, hoehe, winkel_deg):
+    """Prüft ob ein Punkt in einem rotierten Rechteck liegt."""
+    rad = math.radians(-winkel_deg)
+    dx, dy = px - cx, py - cy
+    lx =  dx * math.cos(rad) - dy * math.sin(rad)
+    ly =  dx * math.sin(rad) + dy * math.cos(rad)
+    return abs(lx) <= breite / 2 and abs(ly) <= hoehe / 2
+
+def rect_kollidiert_obb(rect, cx, cy, breite, hoehe, winkel_deg):
+    """Prüft ob ein pygame.Rect ein rotiertes Rechteck schneidet (Punkt-Test)."""
+    test_punkte = [
+        rect.topleft, rect.topright, rect.bottomleft, rect.bottomright,
+        rect.center, rect.midtop, rect.midbottom, rect.midleft, rect.midright,
+    ]
+    return any(punkt_in_obb(px, py, cx, cy, breite, hoehe, winkel_deg)
+               for px, py in test_punkte)
+
+
+def zeichne_gerundetes_panel(surf, rect, farbe, rand_farbe, radius=8, rand_breite=1):
+    pygame.draw.rect(surf, farbe, rect, border_radius=radius)
+    pygame.draw.rect(surf, rand_farbe, rect, rand_breite, border_radius=radius)
+
+def zeichne_neon_linie(surf, farbe, p1, p2, breite=2, glow=True):
+    if glow:
+        glow_farbe = tuple(min(255, c + 60) for c in farbe)
+        pygame.draw.line(surf, glow_farbe, p1, p2, breite + 2)
+    pygame.draw.line(surf, farbe, p1, p2, breite)
+
+
+# ═══════════════════════════════════════════════════════════════
+# GRAS-TEXTUR
+# ═══════════════════════════════════════════════════════════════
+def erstelle_gras_textur(breite, hoehe):
+    surf = pygame.Surface((breite, hoehe))
+    surf.fill(C_GRAS_BASIS)
+    rng = random.Random(42)
+    for _ in range(3500):
+        x, y = rng.randint(0, breite-1), rng.randint(0, hoehe-1)
+        r = rng.randint(6, 45)
+        farbe = C_GRAS_HELL if rng.random() > 0.5 else C_GRAS_DUNKEL
+        pygame.draw.circle(surf, farbe, (x, y), r)
+    for _ in range(7000):
+        x, y = rng.randint(0, breite-1), rng.randint(0, hoehe-1)
+        laenge = rng.randint(3, 10)
+        w = rng.uniform(-0.45, 0.45)
+        g = rng.randint(115, 180)
+        farbe = (rng.randint(28, 55), g, rng.randint(28, 55))
+        pygame.draw.line(surf, farbe, (x, y),
+                         (x + int(math.sin(w)*laenge), y - laenge), 1)
+    for _ in range(500):
+        x, y = rng.randint(0, breite-1), rng.randint(0, hoehe-1)
+        t = rng.random()
+        if t < 0.35:
+            pygame.draw.circle(surf, (200, 195, 75), (x, y), 2)
+        elif t < 0.6:
+            pygame.draw.circle(surf, (225, 225, 215), (x, y), 2)
+        else:
+            pygame.draw.circle(surf, (135, 125, 115), (x, y), rng.randint(1,3))
+    return surf
+
+
+# ═══════════════════════════════════════════════════════════════
+# ROTIERBARE LINIE (Checkpoint & Start/Ziel)
+# ═══════════════════════════════════════════════════════════════
+class RotierbareLinie:
+    """Basis für Start/Ziel und Checkpoints — rotierbar per Drag."""
+
+    def __init__(self, cx, cy, breite, hoehe, farbe, rand_farbe, label=""):
+        self.cx = float(cx)
+        self.cy = float(cy)
+        self.breite  = breite
+        self.hoehe   = hoehe
+        self.winkel  = 0.0          # Grad, 0 = horizontal
+        self.farbe   = farbe
+        self.rand_farbe = rand_farbe
+        self.label   = label
+        self.index   = 0
+        # Zustand
+        self.wird_gedreht  = False
+        self.wird_gezogen  = False
+        self.drag_offset   = (0.0, 0.0)
+        self.dreh_start_maus_winkel  = 0.0
+        self.dreh_start_obj_winkel   = 0.0
+
+    # ── Handle-Positionen ──────────────────────────────────────
+    def handle_pos(self):
+        """Rechtes Ende der Linie = Drehgriff."""
+        hx = self.cx + (self.breite / 2 + HANDLE_R + 4)
+        hy = self.cy
+        return rotiere_punkt(hx, hy, self.cx, self.cy, self.winkel)
+
+    def drag_hit(self, mx, my):
+        """True wenn auf dem Körper der Linie geklickt."""
+        return punkt_in_obb(mx, my, self.cx, self.cy,
+                            self.breite, self.hoehe + 14, self.winkel)
+
+    def handle_hit(self, mx, my):
+        hx, hy = self.handle_pos()
+        return math.hypot(mx - hx, my - hy) <= HANDLE_R + 3
+
+    # ── Mouse-Events ──────────────────────────────────────────
+    def start_drehen(self, mx, my):
+        self.wird_gedreht = True
+        self.dreh_start_maus_winkel  = winkel_zwischen(self.cx, self.cy, mx, my)
+        self.dreh_start_obj_winkel   = self.winkel
+
+    def start_ziehen(self, mx, my):
+        self.wird_gezogen = True
+        self.drag_offset  = (self.cx - mx, self.cy - my)
+
+    def update_maus(self, mx, my):
+        if self.wird_gedreht:
+            delta = winkel_zwischen(self.cx, self.cy, mx, my) - self.dreh_start_maus_winkel
+            self.winkel = (self.dreh_start_obj_winkel + delta) % 360
+        elif self.wird_gezogen:
+            self.cx = mx + self.drag_offset[0]
+            self.cy = my + self.drag_offset[1]
+
+    def stop(self):
+        self.wird_gedreht = False
+        self.wird_gezogen = False
+
+    # ── Kollision ──────────────────────────────────────────────
+    def kollidiert(self, rect):
+        return rect_kollidiert_obb(rect, self.cx, self.cy,
+                                   self.breite, self.hoehe, self.winkel)
+
+    # ── Zeichnen ──────────────────────────────────────────────
+    def zeichne(self, surf, schrift=None, selektiert=False, edit_modus=False):
+        ecken = obb_punkte(self.cx, self.cy, self.breite, self.hoehe, self.winkel)
+        pts   = [(int(x), int(y)) for x, y in ecken]
+
+        # Schatten
+        schatten_pts = [(x+2, y+2) for x, y in pts]
+        pygame.draw.polygon(surf, (0, 0, 0, 80), schatten_pts)
+
+        pygame.draw.polygon(surf, self.farbe, pts)
+        if selektiert:
+            pygame.draw.polygon(surf, C_WEISS, pts, 2)
+        else:
+            pygame.draw.polygon(surf, self.rand_farbe, pts, 1)
+
+        # Streifen-Muster (Schachbrett-ähnlich)
+        self._zeichne_streifen(surf, ecken)
+
+        # Label / Index
+        if schrift and self.label:
+            txt = schrift.render(self.label, True, C_WEISS)
+            # Rotiert auf der Fläche
+            txt_rot = pygame.transform.rotate(txt, -self.winkel)
+            surf.blit(txt_rot, txt_rot.get_rect(center=(int(self.cx), int(self.cy))))
+
+        # Drehgriff (nur im Edit-Modus)
+        if edit_modus:
+            hx, hy = self.handle_pos()
+            hx, hy = int(hx), int(hy)
+            # Verbindungslinie
+            ex = int(self.cx + (self.breite/2) * math.cos(math.radians(self.winkel)))
+            ey = int(self.cy + (self.breite/2) * math.sin(math.radians(self.winkel)))
+            pygame.draw.line(surf, C_TEXT_DIM, (ex, ey), (hx, hy), 1)
+            # Kreis
+            col = C_GELB if self.wird_gedreht else C_CYAN
+            pygame.draw.circle(surf, col, (hx, hy), HANDLE_R)
+            pygame.draw.circle(surf, C_WEISS, (hx, hy), HANDLE_R, 1)
+            # Pfeil-Symbol
+            if schrift:
+                t = schrift.render("↻", True, C_SCHWARZ)
+                surf.blit(t, t.get_rect(center=(hx, hy)))
+
+    def _zeichne_streifen(self, surf, ecken):
+        pass  # Wird von Unterklassen überschrieben
+
+    def als_dict(self):
+        return {"cx": self.cx, "cy": self.cy, "winkel": self.winkel}
+
+    @classmethod
+    def von_dict(cls, d, *args, **kwargs):
+        obj = cls(d["cx"], d["cy"], *args, **kwargs)
+        obj.winkel = d.get("winkel", 0.0)
+        return obj
+
+
+class StartZiel(RotierbareLinie):
+    def __init__(self, cx, cy):
+        super().__init__(cx, cy, SZ_BREITE, SZ_HOEHE, C_ORANGE, C_ORANGE_HELL, "")
+
+    def _zeichne_streifen(self, surf, ecken):
+        # Schwarz-weiße Schachbrettstreifen
+        n = 8
+        for i in range(n):
+            t0 = i / n
+            t1 = (i + 1) / n
+            # Interpoliere entlang der Breite
+            def interp(t):
+                p0 = (ecken[0][0] + t*(ecken[1][0]-ecken[0][0]),
+                      ecken[0][1] + t*(ecken[1][1]-ecken[0][1]))
+                p1 = (ecken[3][0] + t*(ecken[2][0]-ecken[3][0]),
+                      ecken[3][1] + t*(ecken[2][1]-ecken[3][1]))
+                return p0, p1
+            a0, b0 = interp(t0)
+            a1, b1 = interp(t1)
+            farbe = C_SCHWARZ if i % 2 == 0 else C_WEISS
+            pts = [(int(a0[0]), int(a0[1])), (int(a1[0]), int(a1[1])),
+                   (int(b1[0]), int(b1[1])), (int(b0[0]), int(b0[1]))]
+            pygame.draw.polygon(surf, farbe, pts)
+
+    def als_dict(self):
+        d = super().als_dict()
+        return d
+
+    @classmethod
+    def von_dict(cls, d):
+        obj = cls(d["cx"], d["cy"])
+        obj.winkel = d.get("winkel", 0.0)
+        return obj
+
+
+class Checkpoint(RotierbareLinie):
+    def __init__(self, cx, cy, index=0):
+        super().__init__(cx, cy, CP_BREITE, CP_HOEHE, C_LILA, C_LILA_HELL, "")
+        self.index = index
+
+    @property
+    def label(self):
+        return str(self.index + 1)
+
+    @label.setter
+    def label(self, v):
+        pass  # Ignorieren, label ist dynamisch
+
+    def _zeichne_streifen(self, surf, ecken):
+        # Diagonale Streifen in Lila/Weiß
+        n = 6
+        for i in range(n):
+            t0, t1 = i / n, (i + 1) / n
+            def interp(t):
+                p0 = (ecken[0][0] + t*(ecken[1][0]-ecken[0][0]),
+                      ecken[0][1] + t*(ecken[1][1]-ecken[0][1]))
+                p1 = (ecken[3][0] + t*(ecken[2][0]-ecken[3][0]),
+                      ecken[3][1] + t*(ecken[2][1]-ecken[3][1]))
+                return p0, p1
+            a0, b0 = interp(t0)
+            a1, b1 = interp(t1)
+            farbe = C_LILA_HELL if i % 2 == 0 else (100, 40, 145)
+            pts = [(int(a0[0]),int(a0[1])), (int(a1[0]),int(a1[1])),
+                   (int(b1[0]),int(b1[1])), (int(b0[0]),int(b0[1]))]
+            pygame.draw.polygon(surf, farbe, pts)
+
+    def als_dict(self):
+        d = super().als_dict()
+        d["index"] = self.index
+        return d
+
+    @classmethod
+    def von_dict(cls, d):
+        obj = cls(d["cx"], d["cy"], d.get("index", 0))
+        obj.winkel = d.get("winkel", 0.0)
+        return obj
+
+
+# ═══════════════════════════════════════════════════════════════
+# STRECKE
+# ═══════════════════════════════════════════════════════════════
+class Strecke:
+    def __init__(self, gras_surf):
+        self.gras_surf   = gras_surf
+        self.surface     = pygame.Surface((FENSTER_BREITE, FENSTER_HOEHE - TOOLBAR_H))
+        self.linien: list[list] = []
+        self.start_ziel: StartZiel | None = None
+        self.checkpoints: list[Checkpoint] = []
+        self._dicke  = 20
+        self._schrift = None
+        self._render_intern()
+
+    def leere(self):
+        self.linien.clear()
+        self.checkpoints.clear()
+        self.start_ziel = None
+        self._render_intern()
+
+    def _render_intern(self):
+        self.surface.blit(self.gras_surf, (0, 0))
+        for linie in self.linien:
+            if not linie:
+                continue
+            for p in glaette_punkte(linie):
+                pygame.draw.circle(self.surface, C_SCHWARZ, p, self._dicke)
+        # Start/Ziel und Checkpoints auf die surface zeichnen
+        # (für Pixel-Kollision brauchen wir Checkpoints NICHT auf der surface)
+        if self.start_ziel:
+            self.start_ziel.zeichne(self.surface)
+
+    def rendere(self, dicke, schrift=None):
+        self._dicke   = dicke
+        self._schrift = schrift
+        self._render_intern()
+
+    def pixel_auf_strecke(self, x, y):
+        w, h = self.surface.get_size()
+        x = max(0, min(int(x), w - 1))
+        y = max(0, min(int(y), h - 1))
+        farbe = self.surface.get_at((x, y))[:3]
+        return farbe == C_SCHWARZ
+
+    def auf_strecke(self, rect):
+        punkte = [
+            rect.topleft, rect.topright, rect.bottomleft, rect.bottomright,
+            rect.center, rect.midtop, rect.midbottom, rect.midleft, rect.midright,
+        ]
+        treffer = sum(1 for x, y in punkte if self.pixel_auf_strecke(x, y))
+        anteil  = treffer / len(punkte)
+        return anteil, anteil >= STRECKEN_SCHWELLE
+
+
+# ═══════════════════════════════════════════════════════════════
+# AUTO
+# ═══════════════════════════════════════════════════════════════
+class Auto(pygame.sprite.Sprite):
+    def __init__(self, x, y, farbe, steuerung, name):
+        super().__init__()
+        self.name      = name
+        self.farbe     = farbe
+        self.steuerung = steuerung
+
+        self.base_image = pygame.Surface((AUTO_BREITE, AUTO_HOEHE), pygame.SRCALPHA)
+        # Karosserie
+        pygame.draw.rect(self.base_image, farbe, (0, 0, AUTO_BREITE, AUTO_HOEHE), border_radius=5)
+        # Fenster
+        wf = tuple(min(255, c + 60) for c in farbe)
+        pygame.draw.rect(self.base_image, wf, (3, 8, AUTO_BREITE-6, 12), border_radius=3)
+        # Frontlichter
+        pygame.draw.circle(self.base_image, (255,255,200), (4, 3), 2)
+        pygame.draw.circle(self.base_image, (255,255,200), (AUTO_BREITE-4, 3), 2)
+        # Rücklichter
+        pygame.draw.circle(self.base_image, C_ROT, (4, AUTO_HOEHE-4), 2)
+        pygame.draw.circle(self.base_image, C_ROT, (AUTO_BREITE-4, AUTO_HOEHE-4), 2)
+
+        self.image = self.base_image.copy()
+        self.rect  = self.image.get_rect(center=(x, y))
+        self.pos   = pygame.Vector2(x, y)
+        self.angle = 0.0
+        self.speed = 0.0
+
+        self.runden              = 0
+        self.im_ziel             = False
+        self.checkpoints_ok: set[int] = set()
+
+        self.wird_gezogen          = False
+        self.offset                = (0, 0)
+        self.auf_strecke_platziert = False
+        self._offroad_timer        = 0
+
+    def update(self, strecke: Strecke):
+        keys = pygame.key.get_pressed()
+        _, auf_strecke = strecke.auf_strecke(self.rect)
+
+        # Beschleunigung
+        if keys[self.steuerung["oben"]]:
+            self.speed += ACCELERATION
+        elif keys[self.steuerung["unten"]]:
+            self.speed -= BRAKE_POWER
+        else:
+            reibung = FRICTION if auf_strecke else OFFROAD_FRICTION
+            self.speed = (max(0.0, self.speed - reibung) if self.speed > 0
+                          else min(0.0, self.speed + reibung))
+
+        v_max = MAX_SPEED if auf_strecke else MAX_OFFROAD_SPEED
+        self.speed = max(-v_max/2, min(v_max, self.speed))
+
+        # Lenkung
+        if abs(self.speed) > 0.1:
+            lenkwinkel = TURN_SPEED * (1.0 - abs(self.speed)/MAX_SPEED * 0.35)
+            if self.speed < 0:
+                lenkwinkel = -lenkwinkel
+            if keys[self.steuerung["links"]]:
+                self.angle += lenkwinkel
+            if keys[self.steuerung["rechts"]]:
+                self.angle -= lenkwinkel
+
+        self.angle %= 360
+        self.image  = pygame.transform.rotate(self.base_image, self.angle)
+
+        richtung  = pygame.Vector2(0, -1).rotate(-self.angle)
+        self.pos += richtung * self.speed
+        self.rect  = self.image.get_rect(center=(int(self.pos.x), int(self.pos.y)))
+
+        # Spielfeldrand
+        spielfeld = pygame.Rect(0, 0, FENSTER_BREITE, FENSTER_HOEHE - TOOLBAR_H)
+        if not spielfeld.contains(self.rect):
+            self.pos  -= richtung * self.speed
+            self.rect  = self.image.get_rect(center=(int(self.pos.x), int(self.pos.y)))
+            self.speed *= -0.3
+
+        # Offroad-Rüttel
+        self._offroad_timer = ((self._offroad_timer + 1) % 6
+                               if not auf_strecke and abs(self.speed) > 0.2 else 0)
+
+        # Checkpoints
+        for cp in strecke.checkpoints:
+            if cp.kollidiert(self.rect):
+                self.checkpoints_ok.add(cp.index)
+
+        # Ziel
+        if strecke.start_ziel:
+            alle_ok = len(self.checkpoints_ok) >= len(strecke.checkpoints)
+            if strecke.start_ziel.kollidiert(self.rect):
+                if not self.im_ziel and self.speed > 0 and alle_ok:
+                    self.runden += 1
+                    self.checkpoints_ok.clear()
+                    self.im_ziel = True
+            else:
+                self.im_ziel = False
+
+    def get_draw_offset(self):
+        if self._offroad_timer > 0:
+            return (random.randint(-1, 1), random.randint(-1, 1))
+        return (0, 0)
+
+
+# ═══════════════════════════════════════════════════════════════
+# UI-KOMPONENTEN
+# ═══════════════════════════════════════════════════════════════
+class Knopf:
+    def __init__(self, rect, text, farbe=C_PANEL, hover=C_PANEL_RAND,
+                 aktiv_farbe=C_GRUEN, icon=None):
+        self.rect        = rect
+        self.text        = text
+        self.farbe       = farbe
+        self.hover_farbe = hover
+        self.aktiv_farbe = aktiv_farbe
+        self.aktiv       = False
+        self._hover_anim = 0.0  # 0..1
+
+    def zeichne(self, surf, schrift):
+        maus = pygame.mouse.get_pos()
+        hover = self.rect.collidepoint(maus)
+
+        if self.aktiv:
+            bg = self.aktiv_farbe
+            rand = tuple(min(255, c + 50) for c in self.aktiv_farbe)
+        elif hover:
+            bg   = self.hover_farbe
+            rand = C_TEXT_DIM
+        else:
+            bg   = self.farbe
+            rand = C_PANEL_RAND
+
+        # Schatten
+        schatten = self.rect.move(0, 2)
+        pygame.draw.rect(surf, (0,0,0,60), schatten, border_radius=7)
+
+        pygame.draw.rect(surf, bg, self.rect, border_radius=7)
+        pygame.draw.rect(surf, rand, self.rect, 1, border_radius=7)
+
+        # Glanz-Linie oben
+        glanz = pygame.Rect(self.rect.x+2, self.rect.y+1,
+                            self.rect.w-4, 2)
+        glanz_surf = pygame.Surface((glanz.w, glanz.h), pygame.SRCALPHA)
+        glanz_surf.fill((255,255,255,30))
+        surf.blit(glanz_surf, glanz.topleft)
+
+        txt_farbe = C_WEISS if (self.aktiv or hover) else C_TEXT
+        txt = schrift.render(self.text, True, txt_farbe)
+        surf.blit(txt, txt.get_rect(center=self.rect.center))
+
+    def wurde_geklickt(self, ev):
+        return (ev.type == pygame.MOUSEBUTTONDOWN
+                and ev.button == 1
+                and self.rect.collidepoint(ev.pos))
+
+
+class Regler:
+    """Kompakter +/- Regler für Streckendicke."""
+    def __init__(self, x, y, label):
+        self.label  = label
+        self.rect_minus = pygame.Rect(x,      y, 28, 28)
+        self.rect_plus  = pygame.Rect(x + 72, y, 28, 28)
+        self.rect_wert  = pygame.Rect(x + 30, y, 40, 28)
+        self.wert   = 20
+
+    def zeichne(self, surf, schrift):
+        for r, t in [(self.rect_minus, "−"), (self.rect_plus, "+")]:
+            hover = r.collidepoint(pygame.mouse.get_pos())
+            pygame.draw.rect(surf, C_PANEL_RAND if hover else C_PANEL, r, border_radius=5)
+            pygame.draw.rect(surf, C_TEXT_DIM, r, 1, border_radius=5)
+            txt = schrift.render(t, True, C_TEXT)
+            surf.blit(txt, txt.get_rect(center=r.center))
+
+        pygame.draw.rect(surf, (0,0,0,40), self.rect_wert, border_radius=4)
+        txt = schrift.render(str(self.wert), True, C_GELB)
+        surf.blit(txt, txt.get_rect(center=self.rect_wert.center))
+
+        lbl = schrift.render(self.label, True, C_TEXT_DIM)
+        surf.blit(lbl, (self.rect_minus.x,
+                        self.rect_minus.y - 16))
+
+    def handle_click(self, ev, min_v, max_v, schritt):
+        if ev.type != pygame.MOUSEBUTTONDOWN or ev.button != 1:
+            return False
+        if self.rect_minus.collidepoint(ev.pos):
+            self.wert = max(min_v, self.wert - schritt)
+            return True
+        if self.rect_plus.collidepoint(ev.pos):
+            self.wert = min(max_v, self.wert + schritt)
+            return True
+        return False
+
+
+# ═══════════════════════════════════════════════════════════════
+# SPIEL
+# ═══════════════════════════════════════════════════════════════
+class Spiel:
+    def __init__(self):
+        pygame.init()
+        self.fenster = pygame.display.set_mode((FENSTER_BREITE, FENSTER_HOEHE))
+        pygame.display.set_caption("🏁  Rennspiel")
+        self.uhr     = pygame.time.Clock()
+
+        # Schriften
+        self.s_klein  = pygame.font.SysFont("segoeui", 18)
+        self.s_mittel = pygame.font.SysFont("segoeui", 22)
+        self.s_gross  = pygame.font.SysFont("segoeui", 26, bold=True)
+        self.s_sym    = pygame.font.SysFont("segoeui", 16)  # Symbols/Icons
+
+        print("Erzeuge Grastextur …")
+        self.gras_surf = erstelle_gras_textur(FENSTER_BREITE, FENSTER_HOEHE - TOOLBAR_H)
+        self.strecke   = Strecke(self.gras_surf)
+        self.modus     = Modus.ZEICHNEN
+        self.zeichnet  = False
+        self.gezogenes_auto = None
+        self.autos     = pygame.sprite.Group()
+
+        # Aktives Edit-Objekt (Start/Ziel oder Checkpoint)
+        self._edit_obj: RotierbareLinie | None = None
+
+        self._init_autos()
+        self._init_ui()
+        self._lade_strecke()
+        self._update_knopf_status()
+
+        # Feedback-Text
+        self._feedback     = ""
+        self._feedback_t   = 0
+
+    # ── Init ──────────────────────────────────────────────────
+    def _init_autos(self):
+        self.auto1 = Auto(120, 100, C_ROT,
+                          {"oben": pygame.K_w, "unten": pygame.K_s,
+                           "links": pygame.K_a, "rechts": pygame.K_d}, "Rot")
+        self.auto2 = Auto(180, 100, C_BLAU,
+                          {"oben": pygame.K_UP, "unten": pygame.K_DOWN,
+                           "links": pygame.K_LEFT, "rechts": pygame.K_RIGHT}, "Blau")
+        self.autos.add(self.auto1, self.auto2)
+
+    def _init_ui(self):
+        # Toolbar-Y-Mitte
+        ty = FENSTER_HOEHE - TOOLBAR_H + TOOLBAR_H // 2 - 14
+        bh = 32
+
+        self.knoepfe = {
+            "zeichnen":   Knopf(pygame.Rect( 12, ty, 110, bh), "✏  Strecke"),
+            "startziel":  Knopf(pygame.Rect(130, ty, 130, bh), "⬛ Start/Ziel",
+                                C_PANEL, C_PANEL_RAND, C_ORANGE),
+            "checkpoint": Knopf(pygame.Rect(268, ty, 140, bh), "◈  Checkpoints",
+                                C_PANEL, C_PANEL_RAND, C_LILA),
+            "platzieren": Knopf(pygame.Rect(416, ty, 110, bh), "🚗  Autos",
+                                C_PANEL, C_PANEL_RAND, C_CYAN),
+            "fahren":     Knopf(pygame.Rect(534, ty, 120, bh), "▶  Rennen",
+                                C_PANEL, C_PANEL_RAND, C_GRUEN),
+            "reset":      Knopf(pygame.Rect(1220, ty, 120, bh), "🗑  Reset",
+                                C_PANEL, C_PANEL_RAND, C_ROT),
+            "speichern":  Knopf(pygame.Rect(1348, ty, 130, bh), "💾  Speichern",
+                                C_PANEL, C_PANEL_RAND, C_BLAU),
+        }
+
+        # Dicke-Regler (nur im Zeichenmodus sichtbar)
+        self.dicke_regler = Regler(680, FENSTER_HOEHE - TOOLBAR_H + 14, "Dicke")
+        self.dicke_regler.wert = 20
+
+    def _update_knopf_status(self):
+        self.knoepfe["zeichnen"].aktiv   = (self.modus == Modus.ZEICHNEN)
+        self.knoepfe["startziel"].aktiv  = (self.modus == Modus.START_ZIEL)
+        self.knoepfe["checkpoint"].aktiv = (self.modus == Modus.CHECKPOINT)
+        self.knoepfe["platzieren"].aktiv = (self.modus == Modus.PLATZIEREN)
+        self.knoepfe["fahren"].aktiv     = (self.modus == Modus.FAHREN)
+
+    def _wechsel_modus(self, m):
+        self._edit_obj = None
+        self.modus = m
+        self._update_knopf_status()
+
+    def _set_feedback(self, text, dauer=120):
+        self._feedback   = text
+        self._feedback_t = dauer
+
+    # ── Speichern / Laden ─────────────────────────────────────
+    def _speichere_strecke(self):
+        daten = {
+            "linien":      self.strecke.linien,
+            "dicke":       self.dicke_regler.wert,
+            "start_ziel":  self.strecke.start_ziel.als_dict()
+                           if self.strecke.start_ziel else None,
+            "checkpoints": [cp.als_dict() for cp in self.strecke.checkpoints],
+        }
+        SPEICHERDATEI.write_text(json.dumps(daten), encoding="utf-8")
+        self._set_feedback("✓  Strecke gespeichert")
+
+    def _lade_strecke(self):
+        if not SPEICHERDATEI.exists():
+            return
+        daten = json.loads(SPEICHERDATEI.read_text(encoding="utf-8"))
+        self.strecke.linien = [[tuple(p) for p in l]
+                               for l in daten.get("linien", [])]
+        self.dicke_regler.wert = daten.get("dicke", 20)
+
+        sz = daten.get("start_ziel")
+        if sz:
+            self.strecke.start_ziel = StartZiel.von_dict(sz)
+
+        for d in daten.get("checkpoints", []):
+            cp = Checkpoint.von_dict(d)
+            self.strecke.checkpoints.append(cp)
+
+        self.strecke.rendere(self.dicke_regler.wert, self.s_sym)
+
+    # ── Events ───────────────────────────────────────────────
+    def events(self):
+        for ev in pygame.event.get():
+            if ev.type == pygame.QUIT or (
+                    ev.type == pygame.KEYDOWN and ev.key == pygame.K_ESCAPE):
+                pygame.quit(); sys.exit()
+
+            # Scroll → Drehen des selektierten Objekts
+            if ev.type == pygame.MOUSEWHEEL and self._edit_obj:
+                self._edit_obj.winkel = (self._edit_obj.winkel + ev.y * 5) % 360
+                self.strecke.rendere(self.dicke_regler.wert, self.s_sym)
+
+            elif ev.type == pygame.MOUSEBUTTONDOWN:
+                if ev.button == 1:
+                    self._mouse_down(ev)
+                elif ev.button == 3:
+                    self._rechtsklick(ev)
+
+            elif ev.type == pygame.MOUSEMOTION:
+                self._mouse_move(ev)
+
+            elif ev.type == pygame.MOUSEBUTTONUP and ev.button == 1:
+                self._mouse_up(ev)
+
+    def _mouse_up(self, ev):
+        self.zeichnet = False
+        if self._edit_obj:
+            self._edit_obj.stop()
+            self.strecke.rendere(self.dicke_regler.wert, self.s_sym)
+        if self.gezogenes_auto:
+            self.gezogenes_auto.wird_gezogen = False
+            _, ok = self.strecke.auf_strecke(self.gezogenes_auto.rect)
+            self.gezogenes_auto.auf_strecke_platziert = ok
+            self.gezogenes_auto.pos = pygame.Vector2(self.gezogenes_auto.rect.center)
+            self.gezogenes_auto = None
+
+    def _rechtsklick(self, ev):
+        if self.modus == Modus.CHECKPOINT:
+            mx, my = ev.pos
+            for i, cp in enumerate(self.strecke.checkpoints):
+                if cp.drag_hit(mx, my):
+                    self.strecke.checkpoints.pop(i)
+                    for j, c in enumerate(self.strecke.checkpoints):
+                        c.index = j
+                    if self._edit_obj is cp:
+                        self._edit_obj = None
+                    self.strecke.rendere(self.dicke_regler.wert, self.s_sym)
+                    self._set_feedback(f"Checkpoint entfernt")
+                    break
+
+    def _mouse_down(self, ev):
+        # ── Knöpfe ──
+        for name, knopf in self.knoepfe.items():
+            if knopf.wurde_geklickt(ev):
+                self._handle_knopf(name, ev)
+                return
+
+        # Dicke-Regler
+        if self.modus == Modus.ZEICHNEN:
+            if self.dicke_regler.handle_click(ev, DICKE_MIN, DICKE_MAX, DICKE_SCHRITT):
+                self.strecke.rendere(self.dicke_regler.wert, self.s_sym)
+                return
+
+        if ev.pos[1] >= FENSTER_HOEHE - TOOLBAR_H:
+            return
+
+        mx, my = ev.pos
+
+        # ── Modi ──
+        if self.modus == Modus.ZEICHNEN:
+            self.zeichnet = True
+            self.strecke.linien.append([ev.pos])
+
+        elif self.modus == Modus.START_ZIEL:
+            if self.strecke.start_ziel:
+                sz = self.strecke.start_ziel
+                # Handle-Check zuerst
+                if sz.handle_hit(mx, my):
+                    sz.start_drehen(mx, my)
+                    self._edit_obj = sz
+                elif sz.drag_hit(mx, my):
+                    sz.start_ziehen(mx, my)
+                    self._edit_obj = sz
+                else:
+                    # Neues Start/Ziel
+                    self.strecke.start_ziel = StartZiel(mx, my)
+                    self._edit_obj = self.strecke.start_ziel
+                    self.strecke.rendere(self.dicke_regler.wert, self.s_sym)
+            else:
+                self.strecke.start_ziel = StartZiel(mx, my)
+                self._edit_obj = self.strecke.start_ziel
+                self.strecke.rendere(self.dicke_regler.wert, self.s_sym)
+
+        elif self.modus == Modus.CHECKPOINT:
+            # Zuerst prüfen ob ein bestehender CP angeklickt wurde
+            getroffen = None
+            for cp in self.strecke.checkpoints:
+                if cp.handle_hit(mx, my):
+                    cp.start_drehen(mx, my)
+                    self._edit_obj = cp
+                    getroffen = cp
+                    break
+                elif cp.drag_hit(mx, my):
+                    cp.start_ziehen(mx, my)
+                    self._edit_obj = cp
+                    getroffen = cp
+                    break
+            if not getroffen:
+                # Neuen Checkpoint erstellen
+                cp = Checkpoint(mx, my, len(self.strecke.checkpoints))
+                self.strecke.checkpoints.append(cp)
+                self._edit_obj = cp
+                self.strecke.rendere(self.dicke_regler.wert, self.s_sym)
+
+        elif self.modus == Modus.PLATZIEREN:
+            for auto in self.autos:
+                if auto.rect.collidepoint(ev.pos):
+                    auto.wird_gezogen = True
+                    auto.offset = (auto.rect.x - mx, auto.rect.y - my)
+                    self.gezogenes_auto = auto
+                    break
+
+    def _handle_knopf(self, name, ev):
+        if name == "zeichnen":   self._wechsel_modus(Modus.ZEICHNEN)
+        elif name == "startziel":  self._wechsel_modus(Modus.START_ZIEL)
+        elif name == "checkpoint": self._wechsel_modus(Modus.CHECKPOINT)
+        elif name == "platzieren": self._wechsel_modus(Modus.PLATZIEREN)
+        elif name == "fahren":
+            bereit = (self.auto1.auf_strecke_platziert
+                      and self.auto2.auf_strecke_platziert
+                      and self.strecke.start_ziel)
+            if bereit:
+                self._wechsel_modus(Modus.FAHREN)
+            else:
+                self._set_feedback("⚠  Autos auf Strecke platzieren + Start/Ziel setzen!")
+        elif name == "speichern":  self._speichere_strecke()
+        elif name == "reset":
+            self.strecke.leere()
+            self.strecke.rendere(self.dicke_regler.wert, self.s_sym)
+            self._edit_obj = None
+            self._set_feedback("Strecke zurückgesetzt")
+
+    def _mouse_move(self, ev):
+        mx, my = ev.pos
+        if self.modus == Modus.ZEICHNEN and self.zeichnet and my < FENSTER_HOEHE - TOOLBAR_H:
+            self.strecke.linien[-1].append(ev.pos)
+            self.strecke.rendere(self.dicke_regler.wert, self.s_sym)
+
+        elif self._edit_obj and (self._edit_obj.wird_gedreht or self._edit_obj.wird_gezogen):
+            self._edit_obj.update_maus(mx, my)
+            self.strecke.rendere(self.dicke_regler.wert, self.s_sym)
+
+        elif self.gezogenes_auto:
+            self.gezogenes_auto.rect.x = mx + self.gezogenes_auto.offset[0]
+            self.gezogenes_auto.rect.y = my + self.gezogenes_auto.offset[1]
+
+    # ── Zeichnen ─────────────────────────────────────────────
+    def _zeichne_spielfeld(self):
+        self.fenster.blit(self.strecke.surface, (0, 0))
+
+        # Checkpoints über der Strecke zeichnen (nicht eingebacken)
+        edit_modi = self.modus in (Modus.CHECKPOINT, Modus.START_ZIEL,
+                                   Modus.PLATZIEREN, Modus.FAHREN)
+        for cp in self.strecke.checkpoints:
+            sel = (cp is self._edit_obj)
+            cp.zeichne(self.fenster, self.s_sym, selektiert=sel,
+                       edit_modus=(self.modus == Modus.CHECKPOINT))
+
+        # Start/Ziel separat zeichnen (auch hier, für Drehgriff)
+        if self.strecke.start_ziel:
+            sz  = self.strecke.start_ziel
+            sel = (sz is self._edit_obj)
+            sz.zeichne(self.fenster, self.s_sym, selektiert=sel,
+                       edit_modus=(self.modus == Modus.START_ZIEL))
+
+        # Autos
+        for auto in self.autos:
+            ox, oy = auto.get_draw_offset()
+            self.fenster.blit(auto.image, (auto.rect.x + ox, auto.rect.y + oy))
+
+        # Platzierungs-Rahmen
+        if self.modus == Modus.PLATZIEREN:
+            for a in self.autos:
+                farbe = C_GRUEN if a.auf_strecke_platziert else C_ROT
+                pygame.draw.rect(self.fenster, farbe, a.rect.inflate(6, 6), 2, border_radius=4)
+
+        # CP-Vorschau
+        if self.modus == Modus.CHECKPOINT:
+            mx, my = pygame.mouse.get_pos()
+            if my < FENSTER_HOEHE - TOOLBAR_H:
+                # Prüfen ob Hover über bestehendem CP
+                hover_cp = any(cp.drag_hit(mx, my) or cp.handle_hit(mx, my)
+                               for cp in self.strecke.checkpoints)
+                if not hover_cp:
+                    vor = pygame.Surface((CP_BREITE, CP_HOEHE), pygame.SRCALPHA)
+                    vor.fill((*C_LILA, 100))
+                    self.fenster.blit(vor, (mx - CP_BREITE//2, my - CP_HOEHE//2))
+
+        # Offroad-Warn-Labels
+        if self.modus == Modus.FAHREN:
+            for auto in [self.auto1, self.auto2]:
+                _, auf_str = self.strecke.auf_strecke(auto.rect)
+                if not auf_str and abs(auto.speed) > 0.3:
+                    warn = self.s_klein.render("OFFROAD", True, auto.farbe)
+                    bx   = auto.rect.centerx - warn.get_width()//2
+                    by   = auto.rect.top - 22
+                    if 0 <= bx < FENSTER_BREITE and 0 <= by < FENSTER_HOEHE - TOOLBAR_H:
+                        # Hintergrundkasten
+                        bg = pygame.Surface((warn.get_width()+8, warn.get_height()+4),
+                                            pygame.SRCALPHA)
+                        bg.fill((0,0,0,120))
+                        self.fenster.blit(bg, (bx-4, by-2))
+                        self.fenster.blit(warn, (bx, by))
+
+    def _zeichne_toolbar(self):
+        tb_rect = pygame.Rect(0, FENSTER_HOEHE - TOOLBAR_H, FENSTER_BREITE, TOOLBAR_H)
+        pygame.draw.rect(self.fenster, C_TOOLBAR, tb_rect)
+        # Trennlinie oben
+        zeichne_neon_linie(self.fenster, C_PANEL_RAND,
+                           (0, FENSTER_HOEHE - TOOLBAR_H),
+                           (FENSTER_BREITE, FENSTER_HOEHE - TOOLBAR_H), 1, glow=False)
+
+        # Knöpfe
+        for name, knopf in self.knoepfe.items():
+            knopf.zeichne(self.fenster, self.s_mittel)
+
+        # Dicke-Regler (nur Zeichenmodus)
+        if self.modus == Modus.ZEICHNEN:
+            self.dicke_regler.zeichne(self.fenster, self.s_klein)
+
+        # Status-Info in der Mitte
+        info_map = {
+            Modus.ZEICHNEN:   "Maus halten → Strecke zeichnen",
+            Modus.START_ZIEL: "Klick → setzen  |  Ziehen → verschieben  |  ↻-Knopf / Scroll → drehen",
+            Modus.CHECKPOINT: "Klick → setzen  |  Ziehen → verschieben  |  ↻-Knopf / Scroll → drehen  |  Rechtsklick → löschen",
+            Modus.PLATZIEREN: "Auto auf Strecke ziehen (grüner Rahmen = OK)",
+            Modus.FAHREN:     "ROT: WASD   |   BLAU: Pfeiltasten",
+        }
+        info = info_map.get(self.modus, "")
+        txt  = self.s_klein.render(info, True, C_TEXT_DIM)
+        self.fenster.blit(txt, txt.get_rect(
+            center=(FENSTER_BREITE // 2, FENSTER_HOEHE - 14)))
+
+    def _zeichne_hud(self):
+        """Rundenanzeige oben links."""
+        n_cps = len(self.strecke.checkpoints)
+
+        for i, (auto, y_off) in enumerate([(self.auto1, 0), (self.auto2, 1)]):
+            px, py = 16, 16 + i * 62
+            # Panel
+            panel = pygame.Rect(px, py, 200, 52)
+            panel_surf = pygame.Surface((panel.w, panel.h), pygame.SRCALPHA)
+            panel_surf.fill((*C_PANEL, 200))
+            self.fenster.blit(panel_surf, panel.topleft)
+            pygame.draw.rect(self.fenster, auto.farbe, panel, 1, border_radius=6)
+
+            # Name + Runden
+            name_txt  = self.s_gross.render(auto.name, True, auto.farbe)
+            runde_txt = self.s_gross.render(f"Runde {auto.runden}", True, C_TEXT)
+            self.fenster.blit(name_txt,  (px + 8, py + 6))
+            self.fenster.blit(runde_txt, (px + 8 + name_txt.get_width() + 10, py + 6))
+
+            # Checkpoint-Fortschritt (nur Fahrenmodus)
+            if n_cps > 0 and self.modus == Modus.FAHREN:
+                ok = len(auto.checkpoints_ok)
+                cp_bar_w = 184
+                pygame.draw.rect(self.fenster, C_PANEL_RAND,
+                                 (px+8, py+34, cp_bar_w, 10), border_radius=4)
+                if n_cps > 0:
+                    fill = int(cp_bar_w * ok / n_cps)
+                    if fill > 0:
+                        pygame.draw.rect(self.fenster, auto.farbe,
+                                         (px+8, py+34, fill, 10), border_radius=4)
+                cp_txt = self.s_klein.render(f"CP {ok}/{n_cps}", True, C_TEXT_DIM)
+                self.fenster.blit(cp_txt, (px + cp_bar_w - cp_txt.get_width() + 8, py + 34))
+
+        # Feedback-Text
+        if self._feedback_t > 0:
+            alpha = min(255, self._feedback_t * 6)
+            fb_txt = self.s_mittel.render(self._feedback, True, C_GELB)
+            fb_bg  = pygame.Surface((fb_txt.get_width()+20, fb_txt.get_height()+10),
+                                    pygame.SRCALPHA)
+            fb_bg.fill((0, 0, 0, min(200, alpha)))
+            cx = FENSTER_BREITE // 2
+            cy = FENSTER_HOEHE - TOOLBAR_H - 40
+            self.fenster.blit(fb_bg, (cx - fb_bg.get_width()//2, cy))
+            self.fenster.blit(fb_txt, fb_txt.get_rect(center=(cx, cy + fb_bg.get_height()//2)))
+            self._feedback_t -= 1
+
+    def zeichne(self):
+        self._zeichne_spielfeld()
+        self._zeichne_toolbar()
+        self._zeichne_hud()
+        pygame.display.flip()
+
+    # ── Main Loop ─────────────────────────────────────────────
+    def run(self):
+        while True:
+            self.events()
+            if self.modus == Modus.FAHREN:
+                self.autos.update(self.strecke)
+            self.zeichne()
+            self.uhr.tick(FPS)
+
+
+if __name__ == "__main__":
+    Spiel().run()
